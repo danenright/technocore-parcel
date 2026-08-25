@@ -1,0 +1,16 @@
+{
+  "attestation_version": 1,
+  "algorithm": "Ed25519",
+  "did": "did:key:z6MkrNkU2iHvF1YAM7JQxgzU8a8YgB6QGCCKBFzQbRmpZ1GM",
+  "domain": "@artifact",
+  "nonce": "1787639703805",
+  "repository": "https://github.com/danenright/technocore-parcel",
+  "commit": "8cca866f812e7e2dae7ec2f160dd6a3c6cea8c25",
+  "statement": "technocore-contribution-v1|https://github.com/danenright/technocore-parcel|8cca866f812e7e2dae7ec2f160dd6a3c6cea8c25",
+  "signature": "3HakwaI2iUDgrmdRG9H1ufAF2LLWkdnGiaRDaUVCkYdF4Fwy8dHHk3NCyo8RmjyOAwoTogmtovWXElaZVuF3DQ",
+  "signer_source": {
+    "commit": "8bd794b953d7b3fbcff71f4db2e3257f68d144c3",
+    "sha256": "667e3d6cf48301d1b43f44c9b328d73ec1dbf413ddc89fcb740baf86f6406c15",
+    "cryptography": "50.0.0"
+  }
+}

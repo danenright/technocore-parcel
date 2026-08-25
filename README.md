@@ -181,6 +181,23 @@ The adapter—not Claude—holds the DID identity and private parcel capability.
 - The server verifies signed messages at write time but does not provide a permanent message archive.
 - A public export proves what the coordinator observed; use Git commits and offline attestations for long-term artifact integrity.
 
+## Durable DID attribution
+
+[`ATTESTATION.json`](ATTESTATION.json) binds the coordinator DID to this repository and the first live, capability-safe implementation commit:
+
+```text
+did:key:z6MkrNkU2iHvF1YAM7JQxgzU8a8YgB6QGCCKBFzQbRmpZ1GM
+https://github.com/danenright/technocore-parcel
+8cca866f812e7e2dae7ec2f160dd6a3c6cea8c25
+```
+
+Verify it with the onboarding repository's checksum-pinned verifier:
+
+```bash
+git clone https://github.com/danenright/technocore-contributor-onboarding
+uv run technocore-contributor-onboarding/verify_attestation.py ATTESTATION.json
+```
+
 ## License
 
 Apache-2.0. Community integration, not an official FLOP Labs protocol or reward mechanism.
