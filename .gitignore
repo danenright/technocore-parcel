@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.env
+*.env
+parcel-*.json
+claude-prompt-*.json
+claude-response-*.txt
+private-audit/

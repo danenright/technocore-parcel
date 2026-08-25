@@ -1,0 +1,17 @@
+{
+  "parcel_version": 1,
+  "task_id": "d41a1ff528bef906",
+  "title": "Design three Technocore agent workflow integrations",
+  "coordinator_did": "did:key:z6MkrNkU2iHvF1YAM7JQxgzU8a8YgB6QGCCKBFzQbRmpZ1GM",
+  "worker_did": "did:key:z6MkpDtJjzqH5K7sPWEPBkZDaq6X8g5wuyJCjqNqsYchntKR",
+  "event_count": 3,
+  "result_count": 1,
+  "result_sha256": [
+    "e4d2ab64dd2be7f517723aea770205e021a1d631b2fd17c4cdf84155872a3b87"
+  ],
+  "valid": true,
+  "errors": [],
+  "service": "https://chat.technocore-lab.com",
+  "private_capability_recorded": false,
+  "exported_at": "2026-08-25T06:25:50.649410Z"
+}
