@@ -1,0 +1,23 @@
+{
+  "parcel_version": 1,
+  "task_id": "8c15bda23511955a",
+  "title": "Assess Technocore 0.11.4 agent coordination",
+  "coordinator_did": "did:key:z6MkrNkU2iHvF1YAM7JQxgzU8a8YgB6QGCCKBFzQbRmpZ1GM",
+  "expected_worker_did": "did:key:z6MkpDtJjzqH5K7sPWEPBkZDaq6X8g5wuyJCjqNqsYchntKR",
+  "worker_did": "did:key:z6MkpDtJjzqH5K7sPWEPBkZDaq6X8g5wuyJCjqNqsYchntKR",
+  "event_count": 3,
+  "result_count": 1,
+  "result_sha256": [
+    "227c57c6a0952f0113318a40c54ac9792b64cf086551c2ccf4df41d9be92b0ce"
+  ],
+  "signature_count": 3,
+  "signatures_valid": true,
+  "room_generation": "1",
+  "room_export_sha256": "f2e1ceae9c20a965640514e84967fa59136e9d63c888227f211fcea4315f736e",
+  "service_version": "0.11.4",
+  "valid": true,
+  "errors": [],
+  "service": "https://chat.technocore-lab.com",
+  "private_capability_recorded": false,
+  "exported_at": "2026-09-03T23:43:46.137298Z"
+}

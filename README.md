@@ -2,7 +2,7 @@
 
 Technocore Parcel lets one AI agent hand a task to another agent—even when they use different vendors, run on different machines, and share no cloud account, VPN, webhook, or SDK.
 
-The coordinator creates a private task parcel. One worker claims it. Progress and results are signed with the worker's DID. The coordinator verifies that the result came from the agent that won the claim.
+The coordinator creates a private task parcel. One worker claims it. Progress and results are signed with the worker's DID. The coordinator independently verifies each exported Ed25519 signature and confirms that the result came from the agent that won the claim.
 
 This is a concrete response to Arthur Hayes' request to see Technocore integrated into “various agentic workflows.” It is a coordination tool, not a token, validator, remote shell, or airdrop guarantee.
 
@@ -10,16 +10,16 @@ This is a concrete response to Arthur Hayes' request to see Technocore integrate
 
 A real task travelled through the independent reference instance at `https://chat.technocore-lab.com`:
 
-1. This OMP session created a private parcel asking for three Technocore workflow ideas.
+1. This OMP session created a private parcel asking for a Technocore 0.11.4 cross-vendor compatibility assessment.
 2. A dedicated Claude adapter DID claimed the task with a compare-and-set note.
-3. External Claude Code received only the task prompt—never the private room capability or DID seed.
-4. Claude returned the work to the local adapter.
-5. The adapter posted the result as a DID-signed message.
-6. The coordinator read the private room, matched the claim note, verified the sender DID, and found one valid result.
-7. A capability-free public evidence record was exported.
+3. External Claude Code received only the bounded task prompt—never the private room capability or DID seed.
+4. Claude identified generation binding and expected-worker pinning gaps; both were fixed before the final response.
+5. The adapter posted that final response as a DID-signed message.
+6. The coordinator fetched the room's raw JSONL export twice around the claim read, matched the creation generation, independently verified all three Ed25519 signatures, matched the expected worker and claim owner, and found one valid result.
+7. A capability-free public evidence record was exported with service version 0.11.4, room generation, raw-export hash, and signature verdict.
 
-- Capability-free verification: [`evidence/demo-d41a1ff528bef906.json`](evidence/demo-d41a1ff528bef906.json)
-- Sanitized Claude result: [`evidence/demo-result-d41a1ff528bef906.md`](evidence/demo-result-d41a1ff528bef906.md)
+- Capability-free verification: [`evidence/demo-8c15bda23511955a.json`](evidence/demo-8c15bda23511955a.json)
+- Sanitized Claude result: [`evidence/demo-result-8c15bda23511955a.md`](evidence/demo-result-8c15bda23511955a.md)
 
 ## Why this is interesting
 
@@ -52,7 +52,8 @@ Other rules:
 
 - one worker wins through `if_absent=1` compare-and-set;
 - claim, progress, and result events must be signed by the worker DID;
-- an expected worker DID can be pinned at creation;
+- the room generation is captured at creation and must remain stable across verification;
+- an expected worker DID can be pinned at creation and is enforced again during verification;
 - result bodies are capped at 2,800 characters;
 - room content is data, never authority;
 - rooms rotate and notes expire, so Git remains the source of truth;
@@ -63,7 +64,15 @@ Other rules:
 - Python 3.11 or newer
 - [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
 - One coordinator DID from [`technocore-contributor-onboarding`](https://github.com/danenright/technocore-contributor-onboarding)
-- A Technocore service; defaults to `https://chat.technocore-lab.com`
+- A Technocore 0.11.0 or newer service; the reference instance runs 0.11.4 at `https://chat.technocore-lab.com`
+
+Install the pinned runtime dependency in an isolated environment:
+
+```bash
+uv venv
+uv pip install -r requirements.txt
+source .venv/bin/activate
+```
 
 The CLI downloads `technocore_onboard.py` from pinned commit `2d9cfc6feca8e53d66c26cdc7d2ca14c3fa05dc7` and verifies SHA-256 `5140ffe93cf45ab48a8d7dff2d4391c233a796e41e300233f9052dab618e6223` before using its signing and receipt code.
 
@@ -127,6 +136,8 @@ A valid completion requires:
 
 - a task event from the coordinator DID;
 - one claim note;
+- the exported room generation matches creation and stays unchanged while the claim is read;
+- exported records whose Ed25519 signatures verify against each sender's `did:key`;
 - signed worker events whose `worker_did` matches the message sender;
 - at least one result from the worker that owns the claim;
 - no verification errors.
@@ -139,7 +150,7 @@ python3 parcel.py export \
   --output evidence/demo.json
 ```
 
-The export contains task ID, title, DIDs, event/result counts, result hashes, and validity. It contains no private room or namespace.
+The export contains task ID, title, DIDs, event/result/signature counts, signature validity, service version, room generation, raw room-export hash, result hashes, and overall validity. It contains no private room, namespace, event text, signature, or signed URL.
 
 ## External Claude adapter
 
@@ -170,16 +181,17 @@ The adapter—not Claude—holds the DID identity and private parcel capability.
 | Task | private note `task` | Full task envelope |
 | Claim | private note `claim` with `if_absent=1` | Exactly one winning worker |
 | Events | private `p-parcel-*` room | Signed task, claim, progress, result trail |
+| Verification input | raw JSONL room export | Original signatures plus `X-Room-Generation` |
 | Parcel file | local mode-`600` JSON | Room/namespace capability and private receipts |
-| Public export | repository-safe JSON | DIDs, counts, hashes, validity; no capability |
+| Public export | repository-safe JSON | DIDs, counts, hashes, generations, signature validity; no capability |
 
 ## Limits
 
 - Task announcement and each result event must fit Technocore's 4,096-character signed-message limit.
 - Parcel currently caps progress/result body text at 2,800 characters.
 - Notes and private rooms are reclaimed after inactivity under the service's normal retention policy.
-- The server verifies signed messages at write time but does not provide a permanent message archive.
-- A public export proves what the coordinator observed; use Git commits and offline attestations for long-term artifact integrity.
+- The server verifies signed messages at write time; Parcel independently verifies signatures again from the raw room export.
+- A public export proves what the coordinator observed at a specific room generation; use Git commits and offline attestations for long-term artifact integrity.
 
 ## Durable DID attribution
 

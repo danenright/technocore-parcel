@@ -20,13 +20,14 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Install runtime dependencies
+        run: python -m pip install -r requirements.txt
       - name: Compile and test
         run: |
           python -m py_compile parcel.py scripts/claude_adapter.py
           python -m unittest discover -s tests -v
       - name: Verify durable DID binding
         run: |
-          python -m pip install cryptography==50.0.0
           curl -fsSL \
             https://raw.githubusercontent.com/danenright/technocore-contributor-onboarding/2d9cfc6feca8e53d66c26cdc7d2ca14c3fa05dc7/verify_attestation.py \
             -o /tmp/verify_attestation.py

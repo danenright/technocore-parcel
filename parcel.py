@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import datetime
 import hashlib
 import importlib.util
@@ -16,6 +18,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 DEFAULT_SERVICE = os.environ.get("TECHNOCORE_URL", "https://chat.technocore-lab.com").rstrip("/")
 DEFAULT_IDENTITY = Path.home() / ".config" / "technocore" / "agent.env"
@@ -31,6 +36,9 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
 DID_RE = re.compile(r"^did:key:z6Mk[1-9A-HJ-NP-Za-km-z]{44}$")
 TASK_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 MAX_EVENT_BODY_CHARS = 2800
+SIGNATURE_RE = re.compile(r"^[A-Za-z0-9_-]{86}$")
+BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+ED25519_MULTICODEC_PREFIX = b"\xed\x01"
 
 
 class ParcelError(RuntimeError):
@@ -45,20 +53,25 @@ def utc_now() -> str:
     return datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 
-def request_bytes(url: str, payload: dict | None = None) -> bytes:
+def request_response(url: str, payload: dict | None = None) -> tuple[bytes, object]:
     data = None if payload is None else json.dumps(payload, separators=(",", ":")).encode()
-    headers = {"User-Agent": "technocore-parcel/0.1"}
+    headers = {"User-Agent": "technocore-parcel/0.2"}
     if data is not None:
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            return response.read()
+            return response.read(), response.headers
     except urllib.error.HTTPError as error:
         body = error.read().decode("utf-8", errors="replace").strip()
         if error.code == 409:
             raise ClaimConflict(body) from error
         raise ParcelError(f"Technocore HTTP {error.code}: {body or error.reason}") from error
+
+
+def request_bytes(url: str, payload: dict | None = None) -> bytes:
+    body, _ = request_response(url, payload)
+    return body
 
 
 def ensure_onboarding_helper(path: Path = ONBOARDING_CACHE) -> Path:
@@ -218,6 +231,7 @@ def create_parcel(
     onboarding.clean_message(compact_json(task))
     write_note_if_absent(parcel, "task", task)
     signed_event(parcel, identity, task, "contribution")
+    parcel["room_generation"] = room_export(parcel)["generation"]
     path = output or parcel_path(task_id)
     write_private_json(path, parcel, replace=False)
     return path, parcel
@@ -282,37 +296,133 @@ def worker_event(path: Path, identity: Path, event_type: str, body: str) -> dict
     return receipt
 
 
-def room_events(parcel: dict) -> list[dict]:
-    url = f"{parcel['service']}/r/{parcel['room']}?format=json&limit=200&n={time_ns()}"
-    payload = json.loads(request_bytes(url))
-    events = []
-    for message in payload.get("messages", []):
+def base58_decode(value: str) -> bytes:
+    if not value or any(character not in BASE58_ALPHABET for character in value):
+        raise ValueError("invalid base58btc value")
+    number = 0
+    for character in value:
+        number = number * 58 + BASE58_ALPHABET.index(character)
+    decoded = number.to_bytes((number.bit_length() + 7) // 8, "big")
+    return b"\0" * (len(value) - len(value.lstrip("1"))) + decoded
+
+
+def verify_record_signature(room: str, record: dict) -> bool:
+    sender = record.get("from")
+    signature = record.get("sig")
+    nonce = record.get("nonce")
+    text = record.get("text")
+    if (
+        not isinstance(sender, str)
+        or not DID_RE.fullmatch(sender)
+        or not isinstance(signature, str)
+        or not SIGNATURE_RE.fullmatch(signature)
+        or not isinstance(nonce, (str, int))
+        or isinstance(nonce, bool)
+        or not isinstance(text, str)
+    ):
+        return False
+    try:
+        multikey = base58_decode(sender.removeprefix("did:key:z"))
+        if len(multikey) != 34 or not multikey.startswith(ED25519_MULTICODEC_PREFIX):
+            return False
+        signature_bytes = base64.urlsafe_b64decode(signature + "==")
+        if len(signature_bytes) != 64:
+            return False
+        payload = f"{room}|{nonce}|{text}".encode()
+        Ed25519PublicKey.from_public_bytes(multikey[2:]).verify(signature_bytes, payload)
+    except (binascii.Error, InvalidSignature, ValueError):
+        return False
+    return True
+
+
+def room_export(parcel: dict) -> dict:
+    url = f"{parcel['service']}/r/{parcel['room']}/export?n={time_ns()}"
+    body, headers = request_response(url)
+    generation = headers.get("X-Room-Generation")
+    if not generation:
+        raise ParcelError("Technocore room export omitted X-Room-Generation")
+    records = []
+    for line_number, line in enumerate(body.splitlines(), start=1):
+        if not line.strip():
+            continue
         try:
-            event = json.loads(message.get("text", ""))
-        except json.JSONDecodeError:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ParcelError(f"Technocore room export line {line_number} is not JSON") from error
+        if not isinstance(record, dict):
+            raise ParcelError(f"Technocore room export line {line_number} is not an object")
+        records.append(record)
+    return {
+        "generation": generation,
+        "sha256": hashlib.sha256(body).hexdigest(),
+        "records": records,
+    }
+
+
+def parcel_events(parcel: dict, records: list[dict]) -> list[dict]:
+    events = []
+    for record in records:
+        try:
+            event = json.loads(record.get("text", ""))
+        except (json.JSONDecodeError, TypeError):
             continue
         if not isinstance(event, dict) or event.get("task_id") != parcel["task_id"]:
             continue
-        events.append({"seq": message.get("seq"), "ts": message.get("ts"), "from": message.get("from"), "event": event})
+        events.append({"record": record, "event": event})
     return events
+
+
+def room_events(parcel: dict) -> list[dict]:
+    return parcel_events(parcel, room_export(parcel)["records"])
 
 
 def time_ns() -> int:
     return int(datetime.datetime.now(datetime.UTC).timestamp() * 1_000_000_000)
 
 
+def service_version(service: str) -> str:
+    payload = json.loads(request_bytes(f"{service}/.well-known/agent.json"))
+    version = payload.get("version") if isinstance(payload, dict) else None
+    if not isinstance(version, str) or not version:
+        raise ParcelError("Technocore manifest omitted version")
+    return version
+
+
 def verify_parcel(path: Path) -> dict:
     parcel = load_parcel(path)
-    events = room_events(parcel)
+    first_export = room_export(parcel)
     claim = read_note(parcel, "claim")
+    exported = room_export(parcel)
+    events = parcel_events(parcel, exported["records"])
     errors = []
+    recorded_generation = parcel.get("room_generation")
+    if recorded_generation is None:
+        errors.append("parcel did not record its room generation")
+    elif recorded_generation != exported["generation"]:
+        errors.append("room generation did not match parcel creation")
+    if first_export["generation"] != exported["generation"]:
+        errors.append("room generation changed during verification")
+    expected_worker_did = parcel.get("expected_worker_did")
+    if claim and expected_worker_did and claim.get("worker_did") != expected_worker_did:
+        errors.append("claim owner did not match expected worker")
     results = []
+    signature_count = 0
+    task_found = False
+    signatures_valid = bool(events)
     for item in events:
         event = item["event"]
-        sender = item["from"]
+        record = item["record"]
+        sender = record.get("from")
         event_type = event.get("type")
-        if event_type == "task" and sender != parcel["coordinator_did"]:
-            errors.append("task announcement sender did not match coordinator")
+        signature_count += 1
+        signature_valid = verify_record_signature(parcel["room"], record)
+        signatures_valid = signatures_valid and signature_valid
+        if not signature_valid:
+            errors.append(f"{event_type or 'unknown'} event signature was invalid")
+        if event_type == "task":
+            task_found = True
+            if sender != parcel["coordinator_did"]:
+                errors.append("task announcement sender did not match coordinator")
         if event_type in {"claim", "progress", "result"}:
             if event.get("worker_did") != sender:
                 errors.append(f"{event_type} sender did not match worker_did")
@@ -320,6 +430,12 @@ def verify_parcel(path: Path) -> dict:
                 errors.append(f"{event_type} sender did not own claim")
         if event_type == "result":
             results.append(item)
+    if not task_found:
+        errors.append("parcel had no task announcement")
+    if claim is None:
+        errors.append("parcel had no claim")
+    if not results:
+        errors.append("parcel had no result")
     return {
         "parcel_version": 1,
         "task_id": parcel["task_id"],
@@ -329,6 +445,11 @@ def verify_parcel(path: Path) -> dict:
         "event_count": len(events),
         "result_count": len(results),
         "results": results,
+        "signature_count": signature_count,
+        "signatures_valid": signatures_valid,
+        "room_generation": exported["generation"],
+        "room_export_sha256": exported["sha256"],
+        "service_version": service_version(parcel["service"]),
         "errors": errors,
         "valid": not errors and bool(results),
     }
@@ -342,6 +463,7 @@ def export_public(path: Path, output: Path) -> dict:
         "task_id": parcel["task_id"],
         "title": parcel["task"]["title"],
         "coordinator_did": verification["coordinator_did"],
+        "expected_worker_did": parcel.get("expected_worker_did"),
         "worker_did": verification["worker_did"],
         "event_count": verification["event_count"],
         "result_count": verification["result_count"],
@@ -349,6 +471,11 @@ def export_public(path: Path, output: Path) -> dict:
             hashlib.sha256(compact_json(item["event"]).encode()).hexdigest()
             for item in verification["results"]
         ],
+        "signature_count": verification["signature_count"],
+        "signatures_valid": verification["signatures_valid"],
+        "room_generation": verification["room_generation"],
+        "room_export_sha256": verification["room_export_sha256"],
+        "service_version": verification["service_version"],
         "valid": verification["valid"],
         "errors": verification["errors"],
         "service": parcel["service"],
