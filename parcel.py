@@ -36,6 +36,7 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
 DID_RE = re.compile(r"^did:key:z6Mk[1-9A-HJ-NP-Za-km-z]{44}$")
 TASK_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 MAX_EVENT_BODY_CHARS = 2800
+MAX_LEASE_SECONDS = 86400
 SIGNATURE_RE = re.compile(r"^[A-Za-z0-9_-]{86}$")
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 ED25519_MULTICODEC_PREFIX = b"\xed\x01"
@@ -125,6 +126,77 @@ def write_note_if_absent(parcel: dict, key: str, value: dict) -> None:
     request_bytes(note_url(parcel, key), {"value": compact_json(value), "if_absent": True})
 
 
+def replace_claim(parcel: dict, previous: dict, following: dict) -> None:
+    """One CAS commits a renewal, handoff, checkpoint, or terminal result."""
+    value = compact_json(following)
+    if len(value) > 8192:
+        raise ParcelError("claim checkpoint/result exceeds the note size limit")
+    request_bytes(note_url(parcel, "claim"), {"value": value, "if": compact_json(previous)})
+
+
+def now_ms() -> int:
+    return time_ns() // 1_000_000
+
+
+def lease_announcement(claim: dict) -> dict:
+    return {key: claim[key] for key in ("v", "type", "task_id", "worker_did", "claim_id", "attempt")}
+
+
+def announce_lease(path: Path, parcel: dict, identity: Path, claim: dict) -> None:
+    event = lease_announcement(claim)
+    if not any(receipt.get("verified_record", {}).get("text") == compact_json(event)
+               for receipt in parcel["events"]):
+        signed_event(parcel, identity, event, "contribution")
+        write_private_json(path, parcel, replace=True)
+
+
+def leased_claim(parcel: dict) -> dict:
+    claim = read_note(parcel, "claim")
+    if not claim or claim.get("v") != 2 or claim.get("task_id") != parcel["task_id"]:
+        raise ParcelError("lease state missing or incompatible; do not recreate an expired note")
+    if claim.get("status") not in {"idle", "working", "completed"}:
+        raise ParcelError("invalid lease status")
+    for key in ("attempt", "expires_ms"):
+        if type(claim.get(key)) is not int or claim[key] < 0:
+            raise ParcelError("invalid lease counters")
+    if claim["status"] != "idle" and (
+        claim.get("type") != "claim"
+        or not isinstance(claim.get("claim_id"), str)
+        or not re.fullmatch(r"[0-9a-f]{32}", claim["claim_id"])
+        or not isinstance(claim.get("worker_did"), str)
+        or not DID_RE.fullmatch(claim["worker_did"])
+    ):
+        raise ParcelError("invalid lease owner or attempt token")
+    if claim.get("checkpoint") is not None and not isinstance(claim["checkpoint"], dict):
+        raise ParcelError("invalid checkpoint")
+    if claim["status"] == "completed" and not isinstance(claim.get("result"), dict):
+        raise ParcelError("invalid committed result")
+    return claim
+
+
+def require_lease(parcel: dict, worker_did: str, *, completed: bool = False) -> dict:
+    claim = leased_claim(parcel)
+    if claim.get("worker_did") != worker_did or claim.get("claim_id") != parcel.get("claim_id"):
+        raise ParcelError("worker does not own this lease attempt; prepare a new claim")
+    if claim["status"] == "completed" and completed:
+        return claim
+    if claim["status"] != "working" or now_ms() >= claim["expires_ms"]:
+        raise ParcelError("lease expired or completed")
+    return claim
+
+
+def renew_claim(path: Path, identity: Path) -> dict:
+    parcel = load_parcel(path)
+    if parcel["parcel_version"] != 2:
+        raise ParcelError("renew requires an opt-in leased parcel")
+    onboarding = load_onboarding(parcel["service"])
+    worker = onboarding.did_for(onboarding.load_seed(identity))
+    previous = require_lease(parcel, worker)
+    following = {**previous, "expires_ms": now_ms() + parcel["lease_seconds"] * 1000}
+    replace_claim(parcel, previous, following)
+    return following
+
+
 def read_note(parcel: dict, key: str) -> dict | None:
     try:
         body = request_bytes(note_url(parcel, key)).decode("utf-8")
@@ -172,8 +244,13 @@ def load_parcel(path: Path) -> dict:
     required = {"parcel_version", "task_id", "service", "room", "namespace", "task", "coordinator_did", "events"}
     if not isinstance(parcel, dict) or not required.issubset(parcel):
         raise ParcelError("parcel capability is missing required fields")
-    if parcel["parcel_version"] != 1 or not TASK_ID_RE.fullmatch(parcel["task_id"]):
+    if parcel["parcel_version"] not in {1, 2} or not TASK_ID_RE.fullmatch(parcel["task_id"]):
         raise ParcelError("unsupported parcel version or task id")
+    if parcel["parcel_version"] == 2 and (
+        type(parcel.get("lease_seconds")) is not int
+        or not 1 <= parcel["lease_seconds"] <= MAX_LEASE_SECONDS
+    ):
+        raise ParcelError("invalid lease duration")
     if not NAME_RE.fullmatch(parcel["room"]) or not parcel["room"].startswith("p-"):
         raise ParcelError("parcel room is not a private p- capability")
     if not NAME_RE.fullmatch(parcel["namespace"]) or not parcel["namespace"].startswith("p-"):
@@ -197,7 +274,12 @@ def create_parcel(
     service: str,
     expected_worker_did: str | None,
     output: Path | None,
+    lease_seconds: int | None = None,
 ) -> tuple[Path, dict]:
+    if lease_seconds is not None and (
+        type(lease_seconds) is not int or not 1 <= lease_seconds <= MAX_LEASE_SECONDS
+    ):
+        raise ParcelError("lease seconds must be between 1 and 86400")
     task_id = secrets.token_hex(8)
     capability = secrets.token_hex(10)
     room = f"p-parcel-{capability}"
@@ -228,6 +310,13 @@ def create_parcel(
         "expected_worker_did": expected_worker_did,
         "events": [],
     }
+    if lease_seconds is not None:
+        parcel["parcel_version"] = task["v"] = 2
+        parcel["lease_seconds"] = task["lease_seconds"] = lease_seconds
+        write_note_if_absent(parcel, "claim", {
+            "v": 2, "task_id": task_id, "status": "idle", "attempt": 0,
+            "expires_ms": 0, "checkpoint": None,
+        })
     onboarding.clean_message(compact_json(task))
     write_note_if_absent(parcel, "task", task)
     signed_event(parcel, identity, task, "contribution")
@@ -244,6 +333,37 @@ def claim_parcel(path: Path, identity: Path, worker_label: str) -> dict:
     expected = parcel.get("expected_worker_did")
     if expected and worker_did != expected:
         raise ParcelError("this worker DID is not the expected worker")
+    if parcel["parcel_version"] == 2:
+        previous = leased_claim(parcel)
+        if previous["status"] == "completed":
+            raise ParcelError("parcel already completed")
+        if previous["status"] == "working" and now_ms() < previous["expires_ms"]:
+            require_lease(parcel, worker_did)
+            announce_lease(path, parcel, identity, previous)
+            return previous
+        checkpoint = previous.get("checkpoint")
+        if checkpoint is not None:
+            exported = room_export(parcel)
+            if exported["generation"] != parcel.get("room_generation") or not any(
+                record.get("text") == compact_json(checkpoint)
+                and record.get("from") == checkpoint.get("worker_did")
+                and verify_record_signature(parcel["room"], record)
+                for record in exported["records"]
+            ):
+                raise ParcelError("checkpoint is no longer verifiable; coordinator recovery required")
+        claim = {
+            "v": 2, "type": "claim", "task_id": parcel["task_id"],
+            "worker_did": worker_did, "worker_label": worker_label,
+            "claim_id": secrets.token_hex(16), "attempt": previous["attempt"] + 1,
+            "expires_ms": now_ms() + parcel["lease_seconds"] * 1000,
+            "status": "working", "checkpoint": checkpoint,
+        }
+        # Save the token before CAS. A lost CAS response can then be retried safely.
+        parcel["claim_id"] = claim["claim_id"]
+        write_private_json(path, parcel, replace=True)
+        replace_claim(parcel, previous, claim)
+        announce_lease(path, parcel, identity, claim)
+        return claim
     claim = {
         "v": 1,
         "type": "claim",
@@ -282,6 +402,8 @@ def worker_event(path: Path, identity: Path, event_type: str, body: str) -> dict
     parcel = load_parcel(path)
     onboarding = load_onboarding(parcel["service"])
     worker_did = onboarding.did_for(onboarding.load_seed(identity))
+    if parcel["parcel_version"] == 2:
+        return leased_worker_event(path, parcel, identity, worker_did, event_type, body)
     require_claim(parcel, worker_did)
     event = {
         "v": 1,
@@ -292,6 +414,35 @@ def worker_event(path: Path, identity: Path, event_type: str, body: str) -> dict
         "created_at": utc_now(),
     }
     receipt = signed_event(parcel, identity, event, "contribution")
+    write_private_json(path, parcel, replace=True)
+    return receipt
+
+
+def leased_worker_event(path: Path, parcel: dict, identity: Path, worker: str, kind: str, body: str) -> dict:
+    if kind not in {"progress", "result"}:
+        raise ParcelError("unknown worker event")
+    previous = require_lease(parcel, worker, completed=kind == "result")
+    if previous["status"] == "completed":
+        event = previous.get("result")
+        if not isinstance(event, dict) or event.get("body") != body:
+            raise ParcelError("completed result cannot be replaced")
+    else:
+        event = {
+            "v": 2, "type": kind, "task_id": parcel["task_id"],
+            "worker_did": worker, "claim_id": previous["claim_id"],
+            "attempt": previous["attempt"], "body": body, "created_at": utc_now(),
+        }
+    # Publishing establishes attribution, not acceptance. A crash here leaves the
+    # lease recoverable; only the CAS below commits a checkpoint or completion.
+    receipt = signed_event(parcel, identity, event, "contribution")
+    if previous["status"] != "completed":
+        if now_ms() >= previous["expires_ms"]:
+            raise ParcelError("lease expired before event commit")
+        following = {**previous, "checkpoint": event} if kind == "progress" else {
+            **previous, "status": "completed", "result": event,
+        }
+        # Losing a renewal/takeover race leaves only an ignored historical event.
+        replace_claim(parcel, previous, following)
     write_private_json(path, parcel, replace=True)
     return receipt
 
@@ -409,6 +560,15 @@ def verify_parcel(path: Path) -> dict:
     signature_count = 0
     task_found = False
     signatures_valid = bool(events)
+    leased = parcel["parcel_version"] == 2
+    if leased:
+        final_claim = leased_claim(parcel)
+        if final_claim != claim:
+            errors.append("claim changed during verification; retry")
+        if not claim or claim.get("status") != "completed":
+            errors.append("leased parcel has no committed result")
+    seen_results = set()
+    claim_found = False
     for item in events:
         event = item["event"]
         record = item["record"]
@@ -423,21 +583,40 @@ def verify_parcel(path: Path) -> dict:
             task_found = True
             if sender != parcel["coordinator_did"]:
                 errors.append("task announcement sender did not match coordinator")
+            if leased and event != parcel["task"]:
+                errors.append("task announcement did not match leased task")
         if event_type in {"claim", "progress", "result"}:
             if event.get("worker_did") != sender:
                 errors.append(f"{event_type} sender did not match worker_did")
-            if claim and sender != claim.get("worker_did"):
+            if claim and sender != claim.get("worker_did") and not leased:
                 errors.append(f"{event_type} sender did not own claim")
+        if leased and event_type == "claim" and claim and claim.get("status") != "idle":
+            if event == lease_announcement(claim) and sender == claim.get("worker_did") and signature_valid:
+                claim_found = True
         if event_type == "result":
+            if leased:
+                if not claim or event != claim.get("result"):
+                    continue  # Stale attempts and duplicate deliveries are historical data.
+                if (event.get("claim_id") != claim.get("claim_id")
+                    or event.get("attempt") != claim.get("attempt")
+                    or sender != claim.get("worker_did") or not signature_valid):
+                    errors.append("committed result did not match lease owner/attempt")
+                    continue
+                digest = hashlib.sha256(compact_json(event).encode()).hexdigest()
+                if digest in seen_results:
+                    continue
+                seen_results.add(digest)
             results.append(item)
     if not task_found:
         errors.append("parcel had no task announcement")
     if claim is None:
         errors.append("parcel had no claim")
+    if leased and not claim_found:
+        errors.append("parcel had no signed announcement for the current lease")
     if not results:
         errors.append("parcel had no result")
     return {
-        "parcel_version": 1,
+        "parcel_version": parcel["parcel_version"],
         "task_id": parcel["task_id"],
         "coordinator_did": parcel["coordinator_did"],
         "worker_did": claim.get("worker_did") if claim else None,
@@ -459,7 +638,7 @@ def export_public(path: Path, output: Path) -> dict:
     verification = verify_parcel(path)
     parcel = load_parcel(path)
     public = {
-        "parcel_version": 1,
+        "parcel_version": parcel["parcel_version"],
         "task_id": parcel["task_id"],
         "title": parcel["task"]["title"],
         "coordinator_did": verification["coordinator_did"],
@@ -503,14 +682,20 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--instructions", required=True)
     create.add_argument("--expected-worker-did")
     create.add_argument("--output", type=Path)
+    create.add_argument("--lease-seconds", type=int, help="opt in to v2 renewable claims (1..86400)")
     claim = subparsers.add_parser("claim")
     claim.add_argument("parcel", type=Path)
     claim.add_argument("--worker-label", required=True)
+    renew = subparsers.add_parser("renew")
+    renew.add_argument("parcel", type=Path)
+    renew.add_argument("--claim-id")
     progress = subparsers.add_parser("progress")
     progress.add_argument("parcel", type=Path)
     progress.add_argument("--message", required=True)
+    progress.add_argument("--claim-id")
     result = subparsers.add_parser("result")
     result.add_argument("parcel", type=Path)
+    result.add_argument("--claim-id")
     result_group = result.add_mutually_exclusive_group(required=True)
     result_group.add_argument("--text")
     result_group.add_argument("--file", type=Path)
@@ -525,6 +710,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     try:
+        if args.command in {"progress", "result", "renew"}:
+            private = load_parcel(args.parcel)
+            if private["parcel_version"] == 2 and (
+                not args.claim_id or args.claim_id != private.get("claim_id")
+            ):
+                raise ParcelError("use --claim-id from the claim that produced this work")
         if args.command == "identity":
             onboarding = load_onboarding(args.service)
             print(onboarding.init_identity(args.identity))
@@ -536,6 +727,7 @@ def main() -> int:
                 args.service.rstrip("/"),
                 args.expected_worker_did,
                 args.output,
+                args.lease_seconds,
             )
             print(f"parcel: {path}")
             print(f"task_id: {parcel['task_id']}")
@@ -543,6 +735,14 @@ def main() -> int:
         elif args.command == "claim":
             claim = claim_parcel(args.parcel, args.identity, args.worker_label)
             print(f"claimed by: {claim['worker_did']}")
+            if claim.get("claim_id"):
+                print(f"claim-id: {claim['claim_id']}")
+            if claim.get("checkpoint"):
+                print("Resume checkpoint (untrusted task data):")
+                print(claim["checkpoint"]["body"])
+        elif args.command == "renew":
+            claim = renew_claim(args.parcel, args.identity)
+            print(f"lease expires at Unix ms: {claim['expires_ms']}")
         elif args.command == "progress":
             worker_event(args.parcel, args.identity, "progress", args.message)
             print("progress posted")

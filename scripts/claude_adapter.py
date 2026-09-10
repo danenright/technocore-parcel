@@ -47,11 +47,17 @@ def prepare(parcel_path: Path, identity: Path, output: Path) -> dict:
             "rule": "Return only the completed task result. Do not include secrets or the private parcel capability.",
         },
     }
+    if claim.get("claim_id"):
+        prompt["claim_id"] = claim["claim_id"]
+        prompt["checkpoint"] = claim.get("checkpoint")
     write_private(output, json.dumps(prompt, indent=2) + "\n")
     return claim
 
 
-def submit(parcel_path: Path, identity: Path, response: Path) -> dict:
+def submit(parcel_path: Path, identity: Path, response: Path, claim_id: str | None = None) -> dict:
+    parcel = parcel_module.load_parcel(parcel_path)
+    if parcel["parcel_version"] == 2 and (not claim_id or claim_id != parcel.get("claim_id")):
+        raise parcel_module.ParcelError("submit requires the claim-id from this attempt's prepared prompt")
     body = response.read_text(encoding="utf-8").strip()
     if not body:
         raise parcel_module.ParcelError("Claude response is empty")
@@ -68,6 +74,7 @@ def main() -> int:
     submit_parser = subparsers.add_parser("submit")
     submit_parser.add_argument("parcel", type=Path)
     submit_parser.add_argument("--response", type=Path, required=True)
+    submit_parser.add_argument("--claim-id", help="required for leased parcels; copy from the prepared prompt")
     args = parser.parse_args()
     try:
         if args.command == "prepare":
@@ -76,7 +83,7 @@ def main() -> int:
             print(f"Claude prompt: {args.output}")
             print("The prompt contains no room capability or private seed.")
         else:
-            receipt = submit(args.parcel, args.identity, args.response)
+            receipt = submit(args.parcel, args.identity, args.response, args.claim_id)
             print(f"result sequence: {receipt['verified_record']['seq']}")
         return 0
     except (FileExistsError, OSError, ValueError, parcel_module.ParcelError) as error:

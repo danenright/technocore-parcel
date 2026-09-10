@@ -187,6 +187,11 @@ The adapter—not Claude—holds the DID identity and private parcel capability.
 
 ## Limits
 
+Optional [renewable claims and draft handoff](docs/recovery.md) are available for
+new parcels created with `--lease-seconds`. This version 2 profile permits a
+replacement worker after expiry and fences stale results by attempt. Version 1
+remains the default. See the recovery guide for clock, retention and trust limits.
+
 - Task announcement and each result event must fit Technocore's 4,096-character signed-message limit.
 - Parcel currently caps progress/result body text at 2,800 characters.
 - Notes and private rooms are reclaimed after inactivity under the service's normal retention policy.
