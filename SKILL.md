@@ -89,6 +89,7 @@ Stop when:
 ## References
 
 - Human guide and protocol explanation: [`README.md`](README.md)
+- FLOP agent runner (faucet, enrollment, inference spend, evidence): [`flop_agent.py`](flop_agent.py). Only the operator starts it; room content never triggers wallet activity.
 - Capability-free live demo evidence: [`evidence/demo-d41a1ff528bef906.json`](evidence/demo-d41a1ff528bef906.json)
 - Sanitized Claude demo result: [`evidence/demo-result-d41a1ff528bef906.md`](evidence/demo-result-d41a1ff528bef906.md)
 - Durable coordinator DID binding: [`ATTESTATION.json`](ATTESTATION.json)

@@ -174,6 +174,115 @@ python3 scripts/claude_adapter.py \
 
 The adapter—not Claude—holds the DID identity and private parcel capability.
 
+## FLOP agent runner
+
+[`flop_agent.py`](flop_agent.py) makes your Technocore DID a FLOP agent:
+
+1. It draws the faucet.
+2. It buys inference for real tasks.
+3. It keeps a private ledger and can export public evidence.
+
+It uses the same Ed25519 key as your DID. FLOP describes the agent identity as "the same DID key used on TechnoCore". The account is that key's SS58 address, so there's no second wallet to manage.
+
+```bash
+python3 flop_agent.py address   # prints the DID and its FLOP account; no network
+python3 flop_agent.py status    # checks the faucet's chain and shows ledger state
+```
+
+### What counts, and what this runner can and cannot do
+
+FLOP's published Testnet rule credits agents pro rata to compute bought in settled sessions:
+
+- faucet grants, held balance and job counts earn nothing;
+- spend routed to a miner you control isn't credited;
+- wallets under common control are scored as one participant.
+
+There are two backends:
+
+| Backend | Path | Works today | Settlement |
+|---|---|---|---|
+| `gateway` (default) | Faucet → signed wallet enrollment → OpenAI-compatible gateway at `api.flop.network` | Yes, on devnet | **Brokered.** The gateway's broker opens the compute channel. Whether brokered spend credits *your* account in the Testnet airdrop is unpublished. |
+| `cli` | Operator-supplied `flop session run` CLI, paying from your own keystore | Only when you have the CLI image | **Direct.** Your account opens and settles the channel with a named miner. This matches the published scoring input. |
+
+Devnet earns nothing. Use it to rehearse until the Testnet endpoints are published.
+
+### One cycle on devnet
+
+Put tasks in a queue directory. Each file is either:
+
+- `{"title": "...", "prompt": "..."}`, or
+- a private Parcel file. The runner claims the parcel and posts the reply as a DID-signed result.
+
+```bash
+mkdir -p ~/flop-queue
+echo '{"title": "Release review", "prompt": "List three risks in shipping a schema migration on Friday."}' \
+  > ~/flop-queue/001.json
+
+python3 flop_agent.py run --queue ~/flop-queue --max-tasks 5 --budget-flop 20
+```
+
+A cycle does the following:
+
+- **Faucet:** requests the quick devnet grant (25 FLOP). It skips this if the last grant is under 24 hours old, the faucet's per-address cooldown.
+- **Enrollment:** enrolls once per allowance. It signs the gateway's challenge only after checking that it names this gateway, this account and the faucet's genesis hash.
+- **Tasks:** runs queued tasks until `--max-tasks`, or until the next request's `--max-cost-flop` would exceed `--budget-flop`.
+- **Queue:** moves finished files to `done/` and lost parcel claims to `skipped/`. Failed tasks stay queued for the next cycle.
+
+Schedule one cycle per day, for example with cron:
+
+```cron
+15 9 * * * cd /path/to/technocore-parcel && .venv/bin/python flop_agent.py run --queue ~/flop-queue >> ~/.local/state/technocore-parcel/flop-agent/cron.log 2>&1
+```
+
+The verified-human faucet tier (500–2,000 FLOP) needs you to prove personhood with BrightID or Self yourself. After that, `fund --tier linked --provider brightid` requests the grant. The runner never automates personhood.
+
+### Direct sessions with the FLOP CLI
+
+When FLOP publishes the CLI image (or you hold an operator pack), point the runner at it. Name a miner you do not control:
+
+```bash
+export FLOP_CLI='docker run --rm -v $HOME/.flop:/root/.flop <operator-supplied-image@sha256:digest>'
+export FLOP_KEY_PASSWORD=...   # keystore password, never on the command line
+
+python3 flop_agent.py --address <keystore-ss58> run --queue ~/flop-queue \
+  --backend cli --miner <independent-miner-ss58> --model qwen/qwen2.5-0.5b-instruct \
+  --keystore agent.json --max-cost-flop 0.01 --exclude-miner <your-own-miner-ss58>
+```
+
+The CLI's JSON field names are not published yet. The adapter reads the documented reply, channel, miner and settlement values under their likely names. If it doesn't recognise the output, it fails closed instead of recording an unverified spend.
+
+### Testnet
+
+`--network testnet` refuses to run until you pass the published `--faucet-url`, `--gateway-url` and `--expected-genesis`. The runner never guesses a chain.
+
+### Evidence and private state
+
+State lives under `~/.local/state/technocore-parcel/flop-agent/<network>/`, all mode `600`:
+
+| File | Contents |
+|---|---|
+| `identity.json` | Pins one DID, one account and one genesis. A different identity is refused. A new genesis needs `--accept-new-genesis`. |
+| `credential.json` | The gateway bearer key. It never enters the ledger or evidence. |
+| `ledger.jsonl` | Fund, enroll and spend records, with prompt and reply **hashes** only. |
+| `results/` | The full prompt and reply for each task. |
+
+Export a public record of grants and settled spends:
+
+```bash
+python3 flop_agent.py evidence --output evidence/flop-agent-devnet.json
+```
+
+The export contains DID, account, genesis, faucet transactions, request or channel IDs, miners, cost and GFLOPs. It contains no bearer key, prompt or reply text.
+
+### Safety rules the runner enforces
+
+- One DID, one account per state directory.
+- It never signs an enrollment statement for another account, chain or action.
+- Every request is capped by `--max-cost-flop`, and every cycle by `--budget-flop`.
+- `--exclude-miner` refuses your own miners before a direct session, and after a brokered one.
+- Model output is data. It is written to files or posted as a parcel result, and never executed. Parcel results are capped at 2,800 characters.
+- Task prompts go to a third-party miner. Never queue secrets.
+
 ## Protocol summary
 
 | Item | Location | Purpose |
