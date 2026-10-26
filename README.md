@@ -226,6 +226,7 @@ A cycle does the following:
 - **Faucet:** requests the quick devnet grant (25 FLOP). It skips this if the last grant is under 24 hours old, the faucet's per-address cooldown.
 - **Enrollment:** enrolls once per allowance. It signs the gateway's challenge only after checking that it names this gateway, this account and the faucet's genesis hash.
 - **Tasks:** runs queued tasks until `--max-tasks`, or until the next request's `--max-cost-flop` would exceed `--budget-flop`.
+- **Cost cap:** the gateway prices each request at its worst case, `--max-tokens` × the model's per-token price (0.006 FLOP on devnet, so 3.07 FLOP for 512 tokens). It refuses any request whose worst case exceeds `--max-cost-flop`. The runner checks `/models/estimate` first and stops with the numbers before spending. The default gateway cap is 4 FLOP; you are billed for tokens actually generated.
 - **Queue:** moves finished files to `done/` and lost parcel claims to `skipped/`. Failed tasks stay queued for the next cycle.
 
 Schedule one cycle per day, for example with cron:

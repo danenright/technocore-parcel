@@ -41,6 +41,8 @@ SS58_CHECKSUM_PREFIX = b"SS58PRE"
 FAUCET_COOLDOWN_SECONDS = 86_400
 CREDENTIAL_MARGIN_SECONDS = 120
 FUND_SETTLE_SECONDS = 20
+GATEWAY_DEFAULT_MAX_COST_FLOP = 4.0
+CLI_DEFAULT_MAX_COST_FLOP = 0.01
 MAX_PROMPT_CHARS = 16_000
 TASK_SUFFIXES = (".json",)
 
@@ -410,11 +412,31 @@ class GatewayBackend:
         self.max_cost_flop = max_cost_flop
         self.excluded_miners = excluded_miners
 
+    def cost_hint(self, estimate: float | None) -> str:
+        worst = f"{estimate:g} FLOP" if estimate is not None else "more than the cap"
+        return (
+            f"the worst case for --max-tokens {self.max_tokens} is {worst}, above --max-cost-flop "
+            f"{self.max_cost_flop:g}; raise --max-cost-flop or lower --max-tokens"
+        )
+
+    def estimate(self, ctx: AgentContext, model: str, messages: list[dict]) -> float | None:
+        status, body = http_json(
+            "POST",
+            f"{ctx.network.gateway_url}/models/estimate",
+            {"model": model, "messages": messages, "max_tokens": self.max_tokens},
+        )
+        cost = body.get("estimated_cost_flop") if status == 200 else None
+        return float(cost) if isinstance(cost, (int, float)) else None
+
     def complete(self, ctx: AgentContext, prompt: str) -> dict:
         credential = ensure_credential(ctx)
+        messages = [{"role": "user", "content": prompt}]
+        estimate = self.estimate(ctx, credential["model"], messages)
+        if estimate is not None and estimate > self.max_cost_flop:
+            raise AgentError(f"refused before spending: {self.cost_hint(estimate)}")
         payload = {
             "model": credential["model"],
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "max_tokens": self.max_tokens,
             "max_cost_flop": self.max_cost_flop,
             "stream": False,
@@ -422,6 +444,8 @@ class GatewayBackend:
         status, body = http_json(
             "POST", f"{ctx.network.gateway_url}/chat/completions", payload, credential["key"], timeout=300
         )
+        if status == 402 and "max_cost_exceeded" in error_text(status, body):
+            raise AgentError(f"gateway refused the cost cap: {self.cost_hint(estimate)}")
         if status != 200:
             raise AgentError(f"gateway inference failed: {error_text(status, body)}")
         choices = body.get("choices") or []
@@ -440,6 +464,7 @@ class GatewayBackend:
             "request_id": body.get("id"),
             "model": body.get("model"),
             "cost_flop": usage.get("cost_flop"),
+            "estimated_cost_flop": estimate,
             "gflops_used": usage.get("gflops_used"),
             "completion_tokens": usage.get("completion_tokens"),
             "miner": miner,
@@ -707,14 +732,15 @@ def build_backend(args: argparse.Namespace):
     for miner in excluded:
         ss58_public_key(miner)
     if args.backend == "gateway":
-        return GatewayBackend(args.max_tokens, args.max_cost_flop, excluded)
+        cap = args.max_cost_flop if args.max_cost_flop is not None else GATEWAY_DEFAULT_MAX_COST_FLOP
+        return GatewayBackend(args.max_tokens, cap, excluded)
     if not args.miner or not args.model:
         raise AgentError("the cli backend needs --miner and --model")
     return CliBackend(
         args.flop_cli or os.environ.get("FLOP_CLI", ""),
         args.miner,
         args.model,
-        args.max_cost_flop,
+        args.max_cost_flop if args.max_cost_flop is not None else CLI_DEFAULT_MAX_COST_FLOP,
         args.keystore,
         args.password_env,
         args.via,
@@ -745,7 +771,12 @@ def build_parser() -> argparse.ArgumentParser:
         command = subparsers.add_parser(name)
         command.add_argument("--backend", choices=["gateway", "cli"], default="gateway")
         command.add_argument("--max-tokens", type=int, default=512)
-        command.add_argument("--max-cost-flop", type=float, default=1.0)
+        command.add_argument(
+            "--max-cost-flop",
+            type=float,
+            help=f"per-request cap; defaults to {GATEWAY_DEFAULT_MAX_COST_FLOP:g} for gateway "
+            f"and {CLI_DEFAULT_MAX_COST_FLOP:g} for cli (a direct session pays its escrow)",
+        )
         command.add_argument("--exclude-miner", action="append", help="SS58 miner under your control; repeatable")
         command.add_argument("--flop-cli", help="operator-supplied CLI command; defaults to $FLOP_CLI")
         command.add_argument("--miner")

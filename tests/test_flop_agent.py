@@ -50,6 +50,7 @@ class FakeGateway:
         self.address = ctx_address
         self.calls: list[tuple[str, str, dict | None, str | None]] = []
         self.fund_status = 200
+        self.chat_status = 200
         self.completion = {
             "id": "gen-1",
             "model": "qwen/qwen2.5-0.5b-instruct",
@@ -78,7 +79,11 @@ class FakeGateway:
                 "remaining_quota": 25,
                 "expires_at": int(time.time() * 1000) + 86_400_000,
             }
+        if url.endswith("/models/estimate"):
+            return 200, {"estimated_cost_flop": round(payload["max_tokens"] * 0.006, 3)}
         if url.endswith("/chat/completions"):
+            if self.chat_status != 200:
+                return self.chat_status, {"error": "max_cost_exceeded"}
             return 200, self.completion
         if url.endswith("/keys/me"):
             return 200, {"credential": "owner", "remaining_quota": 24.75, "expires_at": None}
@@ -220,7 +225,7 @@ class FundAndEnrollTests(AgentTestCase):
 
 class SpendTests(AgentTestCase):
     def backend(self, excluded: set[str] | None = None):
-        return agent.GatewayBackend(512, 1.0, excluded or set())
+        return agent.GatewayBackend(512, 4.0, excluded or set())
 
     def test_gateway_spend_records_hashes_not_text(self) -> None:
         ctx = self.context()
@@ -233,9 +238,30 @@ class SpendTests(AgentTestCase):
         self.assertNotIn("three risks", ledger)
         bearer_calls = [call for call in self.gateway.calls if call[1].endswith("/chat/completions")]
         self.assertEqual(bearer_calls[0][3], "flop_secret_bearer_value")
-        self.assertEqual(bearer_calls[0][2]["max_cost_flop"], 1.0)
+        self.assertEqual(bearer_calls[0][2]["max_cost_flop"], 4.0)
+        self.assertEqual(entry["estimated_cost_flop"], 3.072)
         results = list(ctx.results_dir.iterdir())
         self.assertEqual(stat.S_IMODE(results[0].stat().st_mode), 0o600)
+
+    def test_cost_cap_below_worst_case_is_refused_before_spending(self) -> None:
+        task = {"kind": "prompt", "path": None, "title": "t", "prompt": "p"}
+        with self.assertRaisesRegex(agent.AgentError, "worst case for --max-tokens 512 is 3.072 FLOP"):
+            agent.run_task(self.context(), agent.GatewayBackend(512, 1.0, set()), task)
+        self.assertFalse(any(call[1].endswith("/chat/completions") for call in self.gateway.calls))
+
+    def test_gateway_cost_refusal_explains_the_fix(self) -> None:
+        self.gateway.chat_status = 402
+        task = {"kind": "prompt", "path": None, "title": "t", "prompt": "p"}
+        with self.assertRaisesRegex(agent.AgentError, "raise --max-cost-flop or lower --max-tokens"):
+            agent.run_task(self.context(), self.backend(), task)
+
+    def test_default_cap_depends_on_backend(self) -> None:
+        args = agent.build_parser().parse_args(["spend", "--prompt", "p"])
+        self.assertEqual(agent.build_backend(args).max_cost_flop, agent.GATEWAY_DEFAULT_MAX_COST_FLOP)
+        args = agent.build_parser().parse_args(
+            ["spend", "--prompt", "p", "--backend", "cli", "--flop-cli", "flop", "--miner", OTHER_MINER, "--model", "m"]
+        )
+        self.assertEqual(agent.build_backend(args).max_cost_flop, agent.CLI_DEFAULT_MAX_COST_FLOP)
 
     def test_gateway_spend_to_excluded_miner_is_refused(self) -> None:
         self.gateway.completion["x_flop_receipt"] = {"miner": OWN_MINER}
@@ -251,7 +277,7 @@ class SpendTests(AgentTestCase):
             (queue / f"{index}.json").write_text(json.dumps({"title": f"t{index}", "prompt": f"p{index}"}))
         (queue / "bad.json").write_text("{}")
         self.gateway.completion["usage"]["cost_flop"] = 1.0
-        summary = agent.run_cycle(ctx, self.backend(), queue, max_tasks=5, budget_flop=2.5, fund_tier="quick")
+        summary = agent.run_cycle(ctx, self.backend(), queue, max_tasks=5, budget_flop=5.5, fund_tier="quick")
         self.assertTrue(summary["funded"]["ok"])
         self.assertEqual(summary["spent"], 2)
         self.assertEqual(sorted(path.name for path in (queue / "done").iterdir()), ["0.json", "1.json"])
@@ -260,7 +286,7 @@ class SpendTests(AgentTestCase):
     def test_cycle_without_funding_skips_faucet(self) -> None:
         queue = self.root / "queue"
         queue.mkdir()
-        agent.run_cycle(self.context(), self.backend(), queue, 1, 1.0, "none")
+        agent.run_cycle(self.context(), self.backend(), queue, 1, 4.0, "none")
         self.assertFalse(any(call[1].endswith("/fund") for call in self.gateway.calls))
 
     def test_parcel_task_claims_and_posts_signed_result(self) -> None:
@@ -346,7 +372,7 @@ class EvidenceTests(AgentTestCase):
         ctx = self.context()
         agent.fund(ctx)
         task = {"kind": "prompt", "path": None, "title": "Private title", "prompt": "Private prompt"}
-        agent.run_task(ctx, agent.GatewayBackend(512, 1.0, set()), task)
+        agent.run_task(ctx, agent.GatewayBackend(512, 4.0, set()), task)
         output = self.root / "evidence.json"
         evidence = agent.export_evidence(ctx, output)
         serialized = output.read_text()
