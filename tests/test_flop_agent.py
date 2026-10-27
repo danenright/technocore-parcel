@@ -51,6 +51,8 @@ class FakeGateway:
         self.calls: list[tuple[str, str, dict | None, str | None]] = []
         self.fund_status = 200
         self.chat_status = 200
+        self.channels: dict[str, dict] = {}
+        self.account_spend = {"totalSpentRaw": "0", "channelCount": 0, "settledChannels": 0}
         self.completion = {
             "id": "gen-1",
             "model": "qwen/qwen2.5-0.5b-instruct",
@@ -85,6 +87,11 @@ class FakeGateway:
             if self.chat_status != 200:
                 return self.chat_status, {"error": "max_cost_exceeded"}
             return 200, self.completion
+        if "/api/compute-channels/" in url:
+            channel = url.rsplit("/", 1)[1]
+            return (200, self.channels[channel]) if channel in self.channels else (404, {"error": "not_found"})
+        if url.endswith("/inference-spend"):
+            return 200, self.account_spend
         if url.endswith("/keys/me"):
             return 200, {"credential": "owner", "remaining_quota": 24.75, "expires_at": None}
         raise AssertionError(f"unexpected request {method} {url}")
@@ -341,6 +348,97 @@ class SpendTests(AgentTestCase):
         self.assertNotIn(private["room"], ctx.ledger_path.read_text())
 
 
+CHANNEL = "0x" + "dc" * 32
+BROKER = "5GsXb3TmNGixuEsbtixqHnqWr9UQJ2M8bkqBQWteNekgF98S"
+
+
+def channel_body(payer: str, status: str = "settled", head: str = "finalized") -> dict:
+    return {
+        "channelId": CHANNEL,
+        "agent": payer,
+        "miner": OTHER_MINER,
+        "escrow": "3168000000000000150",
+        "status": status,
+        "paymentStatus": "PAID" if status == "settled" else "OPEN",
+        "observationHead": head,
+        "aggregateGn": "390",
+        "minerPaid": "3136320000000000149",
+        "burned": "0",
+        "cooperative": True,
+        "settlement": {"kind": "settled", "blockNumber": 2200785, "extrinsicHash": "0xb31d"},
+    }
+
+
+class SettlementTests(AgentTestCase):
+    def spend_with_channel(self, ctx) -> None:
+        self.gateway.completion["x_flop_receipt"] = {"channelId": CHANNEL, "miner": OTHER_MINER, "settlementStatus": "pending"}
+        task = {"kind": "prompt", "path": None, "title": "t", "prompt": "p"}
+        agent.run_task(ctx, agent.GatewayBackend(512, 4.0, set()), task)
+
+    def test_brokered_settlement_is_recorded_as_paid_by_someone_else(self) -> None:
+        ctx = self.context()
+        self.spend_with_channel(ctx)
+        self.gateway.channels[CHANNEL] = channel_body(BROKER)
+        summary = agent.check_settlements(ctx)
+        self.assertEqual(summary["final"], 1)
+        self.assertEqual(summary["paid_by_others_flop"], 3.13632)
+        self.assertEqual(summary["paid_by_this_account_flop"], 0.0)
+        record = agent.latest_settlements(ctx)[CHANNEL]
+        self.assertFalse(record["payer_is_this_account"])
+        self.assertEqual(record["settlement_block"], 2200785)
+
+    def test_direct_settlement_paid_by_this_account_counts(self) -> None:
+        ctx = self.context()
+        self.spend_with_channel(ctx)
+        self.gateway.channels[CHANNEL] = channel_body(ctx.address)
+        summary = agent.check_settlements(ctx)
+        self.assertEqual(summary["paid_by_this_account_flop"], 3.13632)
+
+    def test_pending_channel_is_rechecked_until_final_and_then_left_alone(self) -> None:
+        ctx = self.context()
+        self.spend_with_channel(ctx)
+        self.gateway.channels[CHANNEL] = channel_body(BROKER, status="open", head="best")
+        self.assertEqual(agent.check_settlements(ctx)["pending"], 1)
+        self.assertEqual(agent.check_settlements(ctx)["checked"], 1)
+        settlements = [entry for entry in ctx.ledger if entry.get("kind") == "settlement"]
+        self.assertEqual(len(settlements), 1, "an unchanged pending status is not re-recorded")
+        self.gateway.channels[CHANNEL] = channel_body(BROKER)
+        self.assertEqual(agent.check_settlements(ctx)["final"], 1)
+        lookups = sum(1 for call in self.gateway.calls if "/compute-channels/" in call[1])
+        self.assertEqual(agent.check_settlements(ctx)["checked"], 0)
+        self.assertEqual(sum(1 for call in self.gateway.calls if "/compute-channels/" in call[1]), lookups)
+
+    def test_spend_recorded_before_channel_field_uses_receipt_channel(self) -> None:
+        ctx = self.context()
+        agent.append_ledger(ctx, {"kind": "spend", "ok": True, "request_id": "gen-old", "receipt": {"channelId": CHANNEL}})
+        self.gateway.channels[CHANNEL] = channel_body(BROKER)
+        self.assertEqual(agent.check_settlements(ctx)["final"], 1)
+
+    def test_unindexed_channel_stays_pending(self) -> None:
+        ctx = self.context()
+        self.spend_with_channel(ctx)
+        summary = agent.check_settlements(ctx)
+        self.assertEqual(summary["pending"], 1)
+        self.assertEqual(agent.latest_settlements(ctx)[CHANNEL]["status"], "not_indexed")
+
+    def test_evidence_carries_onchain_settlement(self) -> None:
+        ctx = self.context()
+        self.spend_with_channel(ctx)
+        self.gateway.channels[CHANNEL] = channel_body(BROKER)
+        agent.check_settlements(ctx)
+        evidence = agent.export_evidence(ctx, self.root / "evidence.json")
+        self.assertEqual(evidence["settled_count"], 1)
+        self.assertEqual(evidence["settled_paid_flop"], 3.13632)
+        self.assertEqual(evidence["paid_by_this_account_flop"], 0.0)
+        self.assertEqual(evidence["spends"][0]["onchain"]["payer"], BROKER)
+
+    def test_network_without_explorer_refuses_settlement_lookup(self) -> None:
+        ctx = self.context()
+        ctx.network = agent.Network("testnet", "https://f", "https://g", GENESIS)
+        with self.assertRaisesRegex(agent.AgentError, "--explorer-url"):
+            agent.explorer_get(ctx, "compute-channels/x")
+
+
 class CliBackendTests(AgentTestCase):
     def fake_cli(self, result: dict) -> str:
         script = self.root / "fake_flop.py"
@@ -402,12 +500,15 @@ class EvidenceTests(AgentTestCase):
             self.assertNotIn(secret, serialized)
         self.assertEqual(evidence["spend_count"], 1)
         self.assertEqual(evidence["fund_count"], 1)
-        self.assertEqual(evidence["spent_flop"], 0.25)
+        self.assertEqual(evidence["metered_cost_flop"], 0.25)
+        self.assertEqual(evidence["chain_account_inference_spend"]["total_spent_flop"], 0.0)
 
 
 class NetworkResolutionTests(unittest.TestCase):
     def args(self, **values):
-        defaults = {"network": "devnet", "faucet_url": None, "gateway_url": None, "expected_genesis": None}
+        defaults = {
+            "network": "devnet", "faucet_url": None, "gateway_url": None, "expected_genesis": None, "explorer_url": None,
+        }
         defaults.update(values)
         return mock.Mock(**defaults)
 

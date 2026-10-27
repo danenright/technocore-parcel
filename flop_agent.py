@@ -57,11 +57,18 @@ class Network:
     faucet_url: str
     gateway_url: str
     expected_genesis: str | None = None
+    explorer_url: str | None = None
 
 
 NETWORKS = {
-    "devnet": Network("devnet", "https://faucet.flop.network", "https://api.flop.network/api/v1"),
+    "devnet": Network(
+        "devnet",
+        "https://faucet.flop.network",
+        "https://api.flop.network/api/v1",
+        explorer_url="https://explorer.devnet.flop.network/api",
+    ),
 }
+FINAL_CHANNEL_STATUSES = {"settled", "finalized", "refunded", "expired", "timed_out", "slashed"}
 
 
 @dataclass
@@ -689,7 +696,110 @@ def run_cycle(ctx: AgentContext, backend, queue: Path, max_tasks: int, budget_fl
         summary["spent"] += 1
         summary["spent_flop"] += float(entry.get("cost_flop") or backend.max_cost_flop)
     summary["remaining"] = len(queue_tasks(queue))
+    if ctx.network.explorer_url:
+        try:
+            summary["settlement"] = check_settlements(ctx)
+        except parcel_module.ParcelError as error:
+            summary["settlement_error"] = str(error)[:400]
     return summary
+
+
+def raw_to_flop(value) -> float | None:
+    try:
+        return round(int(str(value).replace(",", "")) / 10**18, 9)
+    except (TypeError, ValueError):
+        return None
+
+
+def explorer_get(ctx: AgentContext, path: str) -> dict | None:
+    if not ctx.network.explorer_url:
+        raise AgentError(f"{ctx.network.name} has no explorer API; pass --explorer-url")
+    status, body = http_json("GET", f"{ctx.network.explorer_url}/{path}")
+    if status == 404:
+        return None
+    if status != 200:
+        raise AgentError(f"explorer lookup failed: {error_text(status, body)}")
+    return body
+
+
+def spend_channel(spend: dict) -> str | None:
+    receipt = spend.get("receipt") if isinstance(spend.get("receipt"), dict) else {}
+    channel = spend.get("channel") or receipt.get("channelId")
+    return str(channel) if channel else None
+
+
+def latest_settlements(ctx: AgentContext) -> dict[str, dict]:
+    latest: dict[str, dict] = {}
+    for entry in ctx.ledger:
+        if entry.get("kind") == "settlement" and entry.get("channel"):
+            latest[str(entry["channel"])] = entry
+    return latest
+
+
+def settlement_record(ctx: AgentContext, spend: dict, channel: str, body: dict | None) -> dict:
+    if body is None:
+        return {"kind": "settlement", "ok": True, "request_id": spend.get("request_id"), "channel": channel,
+                "status": "not_indexed", "final": False}
+    settlement = body.get("settlement") if isinstance(body.get("settlement"), dict) else {}
+    status = body.get("status")
+    payer = body.get("agent")
+    return {
+        "kind": "settlement",
+        "ok": True,
+        "request_id": spend.get("request_id"),
+        "channel": channel,
+        "status": status,
+        "payment_status": body.get("paymentStatus"),
+        "final": status in FINAL_CHANNEL_STATUSES and body.get("observationHead") == "finalized",
+        "payer": payer,
+        "payer_is_this_account": payer == ctx.address,
+        "miner": body.get("miner"),
+        "escrow_flop": raw_to_flop(body.get("escrow")),
+        "miner_paid_flop": raw_to_flop(body.get("minerPaid")),
+        "burned_flop": raw_to_flop(body.get("burned")),
+        "aggregate_gn": int(str(body["aggregateGn"])) if str(body.get("aggregateGn", "")).isdigit() else None,
+        "cooperative": body.get("cooperative"),
+        "settlement_block": settlement.get("blockNumber"),
+        "settlement_extrinsic": settlement.get("extrinsicHash"),
+    }
+
+
+def check_settlements(ctx: AgentContext) -> dict:
+    """Look up each recorded spend's compute channel on the explorer and record on-chain settlement."""
+    latest = latest_settlements(ctx)
+    summary = {"checked": 0, "final": 0, "pending": 0, "paid_by_this_account_flop": 0.0, "paid_by_others_flop": 0.0}
+    for spend in [entry for entry in ctx.ledger if entry.get("kind") == "spend" and entry.get("ok")]:
+        channel = spend_channel(spend)
+        if not channel:
+            continue
+        prior = latest.get(channel)
+        if prior and prior.get("final"):
+            record = prior
+        else:
+            record = settlement_record(ctx, spend, channel, explorer_get(ctx, f"compute-channels/{urllib.parse.quote(channel)}"))
+            summary["checked"] += 1
+            if not prior or (prior.get("status"), prior.get("final")) != (record["status"], record["final"]):
+                record = append_ledger(ctx, record)
+                latest[channel] = record
+        if record.get("final"):
+            summary["final"] += 1
+            paid = float(record.get("miner_paid_flop") or 0)
+            key = "paid_by_this_account_flop" if record.get("payer_is_this_account") else "paid_by_others_flop"
+            summary[key] = round(summary[key] + paid, 9)
+        else:
+            summary["pending"] += 1
+    return summary
+
+
+def account_inference_spend(ctx: AgentContext) -> dict | None:
+    body = explorer_get(ctx, f"accounts/{ctx.address}/inference-spend")
+    if body is None:
+        return None
+    return {
+        "total_spent_flop": raw_to_flop(body.get("totalSpentRaw")),
+        "channel_count": body.get("channelCount"),
+        "settled_channels": body.get("settledChannels"),
+    }
 
 
 PUBLIC_SPEND_FIELDS = (
@@ -700,12 +810,31 @@ PUBLIC_SPEND_FIELDS = (
 )
 
 
+PUBLIC_SETTLEMENT_FIELDS = (
+    "status", "payment_status", "final", "payer", "payer_is_this_account", "escrow_flop",
+    "miner_paid_flop", "burned_flop", "cooperative", "settlement_block", "settlement_extrinsic",
+)
+
+
 def export_evidence(ctx: AgentContext, output: Path) -> dict:
-    spends = [
-        {name: entry[name] for name in PUBLIC_SPEND_FIELDS if entry.get(name) is not None}
-        for entry in ctx.ledger
-        if entry.get("kind") == "spend" and entry.get("ok")
-    ]
+    latest = latest_settlements(ctx)
+    spends = []
+    for entry in ctx.ledger:
+        if entry.get("kind") != "spend" or not entry.get("ok"):
+            continue
+        item = {name: entry[name] for name in PUBLIC_SPEND_FIELDS if entry.get(name) is not None}
+        channel = spend_channel(entry)
+        if channel:
+            item.setdefault("channel", channel)
+        settled = latest.get(channel) if channel else None
+        if settled:
+            item["onchain"] = {name: settled.get(name) for name in PUBLIC_SETTLEMENT_FIELDS}
+        spends.append(item)
+    final = [item["onchain"] for item in spends if item.get("onchain", {}).get("final")]
+    try:
+        chain_spend = account_inference_spend(ctx) if ctx.network.explorer_url else None
+    except parcel_module.ParcelError:
+        chain_spend = None
     funds = [
         {name: entry.get(name) for name in ("ts", "tier", "amount_flop", "tx_hash")}
         for entry in ctx.ledger
@@ -720,7 +849,13 @@ def export_evidence(ctx: AgentContext, output: Path) -> dict:
         "fund_count": len(funds),
         "funds": funds,
         "spend_count": len(spends),
-        "spent_flop": sum(float(item.get("cost_flop") or 0) for item in spends),
+        "metered_cost_flop": round(sum(float(item.get("cost_flop") or 0) for item in spends), 9),
+        "settled_count": len(final),
+        "settled_paid_flop": round(sum(float(item.get("miner_paid_flop") or 0) for item in final), 9),
+        "paid_by_this_account_flop": round(
+            sum(float(item.get("miner_paid_flop") or 0) for item in final if item.get("payer_is_this_account")), 9
+        ),
+        "chain_account_inference_spend": chain_spend,
         "spends": spends,
         "exported_at": utc_now(),
     }
@@ -737,16 +872,25 @@ def export_evidence(ctx: AgentContext, output: Path) -> dict:
 
 
 def resolve_network(args: argparse.Namespace) -> Network:
+    explorer = args.explorer_url.rstrip("/") if args.explorer_url else None
     if args.network in NETWORKS and not (args.faucet_url or args.gateway_url):
         base = NETWORKS[args.network]
-        return Network(base.name, base.faucet_url, base.gateway_url, args.expected_genesis or base.expected_genesis)
+        return Network(
+            base.name,
+            base.faucet_url,
+            base.gateway_url,
+            args.expected_genesis or base.expected_genesis,
+            explorer or base.explorer_url,
+        )
     if not (args.faucet_url and args.gateway_url and args.expected_genesis):
         raise AgentError(
             f"{args.network} has no published endpoints yet; pass --faucet-url, --gateway-url and --expected-genesis"
         )
     if not GENESIS_RE.fullmatch(args.expected_genesis):
         raise AgentError("--expected-genesis must be a 0x-prefixed 32-byte hex hash")
-    return Network(args.network, args.faucet_url.rstrip("/"), args.gateway_url.rstrip("/"), args.expected_genesis)
+    return Network(
+        args.network, args.faucet_url.rstrip("/"), args.gateway_url.rstrip("/"), args.expected_genesis, explorer
+    )
 
 
 def build_backend(args: argparse.Namespace):
@@ -779,6 +923,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--faucet-url")
     parser.add_argument("--gateway-url")
     parser.add_argument("--expected-genesis")
+    parser.add_argument("--explorer-url", help="explorer API base used to confirm on-chain settlement")
     parser.add_argument("--address", help="SS58 account to fund instead of the DID-derived account")
     parser.add_argument("--accept-new-genesis", action="store_true")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -789,6 +934,7 @@ def build_parser() -> argparse.ArgumentParser:
     fund_parser.add_argument("--provider", choices=["brightid", "self"])
     fund_parser.add_argument("--force", action="store_true")
     subparsers.add_parser("enroll")
+    subparsers.add_parser("settle")
     for name in ("spend", "run"):
         command = subparsers.add_parser(name)
         command.add_argument("--backend", choices=["gateway", "cli"], default="gateway")
@@ -841,7 +987,11 @@ def main() -> int:
                 "credential_model": credential.get("model") if credential else None,
                 "credential_expires_at": credential.get("expires_at") if credential else None,
                 "spends": sum(1 for entry in ctx.ledger if entry.get("kind") == "spend" and entry.get("ok")),
+                "settled_spends": sum(1 for entry in latest_settlements(ctx).values() if entry.get("final")),
+                "chain_account_inference_spend": account_inference_spend(ctx) if ctx.network.explorer_url else None,
             }, indent=2))
+        elif args.command == "settle":
+            print(json.dumps(check_settlements(ctx), indent=2))
         elif args.command == "fund":
             print(json.dumps(fund(ctx, args.tier, args.provider, args.force), indent=2))
         elif args.command == "enroll":

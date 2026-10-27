@@ -201,7 +201,7 @@ There are two backends:
 
 | Backend | Path | Works today | Settlement |
 |---|---|---|---|
-| `gateway` (default) | Faucet → signed wallet enrollment → OpenAI-compatible gateway at `api.flop.network` | Yes, on devnet | **Brokered.** The gateway's broker opens the compute channel. Whether brokered spend credits *your* account in the Testnet airdrop is unpublished. |
+| `gateway` (default) | Faucet → signed wallet enrollment → OpenAI-compatible gateway at `api.flop.network` | Yes, on devnet | **Brokered.** The gateway's broker account opens and pays the compute channel. On devnet the explorer records that spend against the broker, and your account shows **0** inference spend, so expect gateway spend not to credit you. |
 | `cli` | Operator-supplied `flop session run` CLI, paying from your own keystore | Only when you have the CLI image | **Direct.** Your account opens and settles the channel with a named miner. This matches the published scoring input. |
 
 Devnet earns nothing. Use it to rehearse until the Testnet endpoints are published.
@@ -226,7 +226,8 @@ A cycle does the following:
 - **Faucet:** requests the quick devnet grant (25 FLOP). It skips this if the last grant is under 24 hours old, the faucet's per-address cooldown.
 - **Enrollment:** enrolls once per allowance. It signs the gateway's challenge only after checking that it names this gateway, this account and the faucet's genesis hash.
 - **Tasks:** runs queued tasks until `--max-tasks`, or until the next request's `--max-cost-flop` would exceed `--budget-flop`.
-- **Cost cap:** the gateway prices each request at its worst case, `--max-tokens` × the model's per-token price (0.006 FLOP on devnet, so 3.07 FLOP for 512 tokens). It refuses any request whose worst case exceeds `--max-cost-flop`. The runner checks `/models/estimate` first and stops with the numbers before spending. The default gateway cap is 4 FLOP; you are billed for tokens actually generated.
+- **Cost cap:** the gateway prices each request at its worst case, `--max-tokens` × the model's per-token price (0.006 FLOP on devnet, so 3.07 FLOP for 512 tokens). It refuses any request whose worst case exceeds `--max-cost-flop`. The runner checks `/models/estimate` first and stops with the numbers before spending. The default gateway cap is 4 FLOP. On devnet, cooperative settlement paid the miner almost the whole reserved escrow, not the metered `G_n` cost.
+- **Settlement:** after spending, the cycle looks up each recorded compute channel on the explorer and records the on-chain result.
 - **Queue:** moves finished files to `done/` and lost parcel claims to `skipped/`. Failed tasks stay queued for the next cycle.
 
 Schedule one cycle per day, for example with cron:
@@ -256,6 +257,26 @@ The CLI's JSON field names are not published yet. The adapter reads the document
 
 `--network testnet` refuses to run until you pass the published `--faucet-url`, `--gateway-url` and `--expected-genesis`. The runner never guesses a chain.
 
+### Confirm settlement on chain
+
+A spend is first recorded with the gateway's receipt, whose settlement is `pending`. The `settle` command looks up each channel at the explorer API (`explorer.devnet.flop.network/api/compute-channels/<id>`). It appends a `settlement` record once the status changes, and stops checking a channel once it is final on a finalized block. `run` does the same at the end of every cycle.
+
+```bash
+python3 flop_agent.py settle
+python3 flop_agent.py status     # settled_spends plus the explorer's inference spend for your account
+```
+
+Each settlement record notes:
+
+- the channel status and payment status;
+- the **payer** account, and whether the payer is this account;
+- escrow, miner paid and burned amounts in FLOP;
+- the settlement block and extrinsic.
+
+`paid_by_this_account_flop` is the figure that matches the published agent scoring input, compute bought in settled sessions. Brokered gateway spend appears under `paid_by_others_flop`.
+
+For testnet, also pass `--explorer-url` once FLOP publishes it.
+
 ### Evidence and private state
 
 State lives under `~/.local/state/technocore-parcel/flop-agent/<network>/`, all mode `600`:
@@ -264,7 +285,7 @@ State lives under `~/.local/state/technocore-parcel/flop-agent/<network>/`, all 
 |---|---|
 | `identity.json` | Pins one DID, one account and one genesis. A different identity is refused. A new genesis needs `--accept-new-genesis`. |
 | `credential.json` | The gateway bearer key. It never enters the ledger or evidence. |
-| `ledger.jsonl` | Fund, enroll and spend records, with prompt and reply **hashes** only. |
+| `ledger.jsonl` | Fund, enroll, spend and settlement records, with prompt and reply **hashes** only. |
 | `results/` | The full prompt and reply for each task. |
 
 Export a public record of grants and settled spends:
@@ -273,7 +294,16 @@ Export a public record of grants and settled spends:
 python3 flop_agent.py evidence --output evidence/flop-agent-devnet.json
 ```
 
-The export contains DID, account, genesis, faucet transactions, request or channel IDs, miners, cost and GFLOPs. It contains no bearer key, prompt or reply text.
+The export contains:
+
+- DID, account and genesis;
+- faucet transactions;
+- request and channel IDs, miners, and metered cost;
+- each spend's on-chain settlement: payer, miner paid, block and extrinsic;
+- totals for settled spend and spend paid by this account;
+- the explorer's inference-spend figure for the account.
+
+It contains no bearer key, prompt or reply text.
 
 ### Safety rules the runner enforces
 
