@@ -243,6 +243,28 @@ class SpendTests(AgentTestCase):
         results = list(ctx.results_dir.iterdir())
         self.assertEqual(stat.S_IMODE(results[0].stat().st_mode), 0o600)
 
+    def test_metered_cost_is_read_from_the_gateway_receipt(self) -> None:
+        del self.gateway.completion["usage"]["cost_flop"]
+        self.gateway.completion["x_flop_receipt"] = {
+            "aggregateGn": "390",
+            "channelId": "0x" + "dc" * 32,
+            "miner": OTHER_MINER,
+            "priceSnapshot": {"flopPerGn": "0.003"},
+            "reservedRaw": "3168000000000000149",
+            "settlementStatus": "pending",
+        }
+        task = {"kind": "prompt", "path": None, "title": "t", "prompt": "p"}
+        entry = agent.run_task(self.context(), self.backend(), task)
+        self.assertEqual(entry["cost_flop"], 1.17)
+        self.assertEqual(entry["aggregate_gn"], 390)
+        self.assertAlmostEqual(entry["reserved_flop"], 3.168)
+        self.assertEqual(entry["channel"], "0x" + "dc" * 32)
+        self.assertEqual(entry["settlement_status"], "pending")
+
+    def test_receipt_without_price_leaves_cost_unknown(self) -> None:
+        self.assertIsNone(agent.receipt_cost({"aggregateGn": "390"})["cost_flop"])
+        self.assertIsNone(agent.receipt_cost(None)["reserved_flop"])
+
     def test_cost_cap_below_worst_case_is_refused_before_spending(self) -> None:
         task = {"kind": "prompt", "path": None, "title": "t", "prompt": "p"}
         with self.assertRaisesRegex(agent.AgentError, "worst case for --max-tokens 512 is 3.072 FLOP"):

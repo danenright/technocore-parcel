@@ -458,20 +458,41 @@ class GatewayBackend:
         if miner and miner in self.excluded_miners:
             raise AgentError("gateway routed the request to an excluded miner; its spend would not be independent")
         _, quota = http_json("GET", f"{ctx.network.gateway_url}/keys/me", bearer=credential["key"])
+        metered = receipt_cost(receipt)
         return {
             "backend": self.name,
             "reply": reply,
             "request_id": body.get("id"),
             "model": body.get("model"),
-            "cost_flop": usage.get("cost_flop"),
+            "cost_flop": usage.get("cost_flop") if usage.get("cost_flop") is not None else metered["cost_flop"],
             "estimated_cost_flop": estimate,
+            "reserved_flop": metered["reserved_flop"],
+            "aggregate_gn": metered["aggregate_gn"],
             "gflops_used": usage.get("gflops_used"),
             "completion_tokens": usage.get("completion_tokens"),
             "miner": miner,
+            "channel": (receipt or {}).get("channelId"),
+            "settlement_status": (receipt or {}).get("settlementStatus"),
             "receipt": receipt,
             "remaining_quota": quota.get("remaining_quota"),
             "settlement": "brokered",
         }
+
+
+def receipt_cost(receipt: dict | None) -> dict:
+    """Metered cost from a gateway receipt: aggregate G_n times the snapshot's FLOP per G_n."""
+    receipt = receipt or {}
+    snapshot = receipt.get("priceSnapshot") if isinstance(receipt.get("priceSnapshot"), dict) else {}
+    try:
+        aggregate_gn = int(receipt["aggregateGn"])
+        cost = round(aggregate_gn * float(snapshot["flopPerGn"]), 9)
+    except (KeyError, TypeError, ValueError):
+        aggregate_gn, cost = None, None
+    try:
+        reserved = int(receipt["reservedRaw"]) / 10**18
+    except (KeyError, TypeError, ValueError):
+        reserved = None
+    return {"cost_flop": cost, "reserved_flop": reserved, "aggregate_gn": aggregate_gn}
 
 
 class CliBackend:
@@ -673,7 +694,8 @@ def run_cycle(ctx: AgentContext, backend, queue: Path, max_tasks: int, budget_fl
 
 PUBLIC_SPEND_FIELDS = (
     "ts", "network", "genesis", "address", "backend", "settlement", "model", "miner", "request_id",
-    "channel", "settlement_tx", "verified_turns", "cost_flop", "gflops_used", "completion_tokens",
+    "channel", "settlement_tx", "settlement_status", "verified_turns", "cost_flop", "aggregate_gn",
+    "gflops_used", "completion_tokens",
     "task_kind", "prompt_sha256", "reply_sha256", "parcel_result_seq",
 )
 
